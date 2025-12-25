@@ -1,74 +1,79 @@
 import os
-from dotenv import load_dotenv
+import json
+import faiss
+import torch
+from sentence_transformers import SentenceTransformer
 from groq import Groq
-from retriever import retrieve_context
+import streamlit as st  # For secrets
 
-load_dotenv()
+# ----------------- Load API Key -----------------
+# Works locally if .streamlit/secrets.toml exists, and on Streamlit Cloud
+GROQ_API_KEY = st.secrets["GROQ"]["api_key"]
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# Initialize Groq client
+client = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = """
-You are an AI Travel Agent.
+# ----------------- Load Knowledge Base -----------------
+# Load FAISS index
+faiss_index_path = "travel_faiss.index"
+index = faiss.read_index(faiss_index_path)
 
-Instructions:
-- Use retrieved context if available.
-- If context is weak, give general but safe travel advice.
-- Do not hallucinate facts.
-- Answer clearly in bullet points.
-"""
+# Load chunk metadata
+with open("chunk_metadata.pkl", "rb") as f:
+    chunk_metadata = torch.load(f)
 
-def decide_tool(query):
-    keywords = ["eco", "budget", "solo", "luxury", "adventure"]
+# Load chunk texts
+with open("chunks.json", "r", encoding="utf-8") as f:
+    chunks = json.load(f)
 
-    for k in keywords:
-        if k in query.lower():
-            return "retrieve", f"Keyword '{k}' detected → using knowledge base"
+# Load SentenceTransformer model
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-    return "fallback", "No domain keyword detected → using general reasoning"
+# ----------------- Retrieval Function -----------------
+def retrieve(query, k=5):
+    """
+    Retrieve top-k relevant chunks from FAISS index based on query.
+    """
+    query_embedding = embed_model.encode([query])
+    D, I = index.search(query_embedding, k)
+    results = []
+    for idx in I[0]:
+        if idx < len(chunks):
+            results.append(chunks[idx])
+    return results
 
-
+# ----------------- Generate Answer -----------------
 def generate_answer(query):
-    tool, reason = decide_tool(query)
-    print(f"[Agent Decision] {reason}")
+    """
+    Generate an answer using Groq LLM based on retrieved context.
+    """
+    context_chunks = retrieve(query)
+    context_text = "\n".join(context_chunks)
 
-    if tool == "retrieve":
-        context = retrieve_context(query)
-        if len(context.strip()) < 150:
-            context = "General travel best practices and safety guidelines."
-            sources = "Source:\n• General travel best practices"
-        else:
-            sources = "Sources:\n• Wikipedia\n• Wikivoyage"
-    else:
-        context = "General travel best practices and safety guidelines."
-        sources = "Source:\n• General travel best practices"
+    prompt = f"""
+You are a helpful travel assistant. Use the following context to answer the question.
 
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"""
 Context:
-{context}
+{context_text}
 
-Question:
-{query}
+Question: {query}
 
-At the end of the answer, include the following source information exactly as provided:
-{sources}
+Answer:
 """
-            }
-        ],
-        temperature=0.4
+    response = client.chat.completions.create(
+        model="llama3-8b",  # Update model if deprecated
+        messages=[{"role": "user", "content": prompt}],
+        max_output_tokens=500
     )
+    answer = response.choices[0].message["content"]
+    return answer
 
-    return response.choices[0].message.content
-
-# CLI LOOP
-if __name__ == "__main__":
-    while True:
-        q = input("\nAsk a travel question (or 'exit'): ")
-        if q.lower() == "exit":
-            break
-        print("\nAnswer:\n", generate_answer(q))
+# ----------------- Optional: Agent Decision -----------------
+def agent_decision(query):
+    """
+    Simple domain detection for RAG vs general reasoning.
+    """
+    domains = ["adventure", "solo", "budget", "eco", "luxury"]
+    if any(word.lower() in query.lower() for word in domains):
+        return "retrieve_knowledge"
+    return "general_reasoning"
