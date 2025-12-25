@@ -1,7 +1,7 @@
-streamlit
-torch
-tensorflow
-sentence-transformers
-faiss-cpu
+streamlit==1.28.0
+torch==2.2.0
+tensorflow<=2.13
+tf-keras
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
 groq
-python-dotenv
